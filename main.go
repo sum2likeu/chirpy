@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sum2likeu/chirpy/internal/auth"
+
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	"github.com/sum2likeu/chirpy/internal/database"
@@ -61,6 +63,7 @@ func main() {
 	servHandler.HandleFunc("POST /admin/reset", apiCfg.handlerResetRequestCount)
 	servHandler.HandleFunc("POST /api/chirps", apiCfg.handlerValidate)
 	servHandler.HandleFunc("POST /api/users", apiCfg.handlerUserByEmail)
+	servHandler.HandleFunc("POST /api/login", apiCfg.handlerLogin)
 	log.Fatal(s.ListenAndServe())
 }
 func handlerReadiness(w http.ResponseWriter, r *http.Request) {
@@ -208,7 +211,8 @@ func respondWithError(w http.ResponseWriter, code int, e string) {
 }
 func (cfg *apiConfig) handlerUserByEmail(w http.ResponseWriter, r *http.Request) {
 	type useremail struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 	params := useremail{}
 	decoder := json.NewDecoder(r.Body)
@@ -218,7 +222,15 @@ func (cfg *apiConfig) handlerUserByEmail(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, 500, "something went wrong")
 		return
 	}
-	userresp, err := cfg.db.CreateUser(r.Context(), params.Email)
+	hash, err := auth.HashPassword(params.Password)
+	if err != nil {
+		respondWithError(w, 500, "couldn't hash password")
+		return
+	}
+	userresp, err := cfg.db.CreateUser(r.Context(), database.CreateUserParams{
+		Email:          params.Email,
+		HashedPassword: hash,
+	})
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		respondWithError(w, 500, "something went wrong")
@@ -303,4 +315,58 @@ func (cfg *apiConfig) handlerGetChirp(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
 	w.Write(dat)
+}
+func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
+	type useremail struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	params := useremail{}
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&params)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 500, "something went wrong")
+		return
+	}
+	userinfo, err := cfg.db.GetHashByEmail(r.Context(), params.Email)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	check, err := auth.CheckPasswordHash(params.Password, userinfo.HashedPassword)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	if check == false {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	if check == true {
+		type user struct {
+			ID     uuid.UUID `json:"id"`
+			Create time.Time `json:"created_at"`
+			Update time.Time `json:"updated_at"`
+			Email  string    `json:"email"`
+		}
+		userinfo := user{
+			ID:     userinfo.ID,
+			Create: userinfo.CreatedAt,
+			Update: userinfo.UpdatedAt,
+			Email:  userinfo.Email,
+		}
+		dat, err := json.Marshal(userinfo)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			respondWithError(w, 500, "something went wrong")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write(dat)
+	}
 }
