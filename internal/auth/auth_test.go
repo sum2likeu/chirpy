@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestSomething(t *testing.T) {
+func TestHash(t *testing.T) {
 	got, err := HashPassword("input")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

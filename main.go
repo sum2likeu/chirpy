@@ -34,6 +34,7 @@ func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	secret := os.Getenv("SECRET")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		fmt.Println(err)
@@ -42,6 +43,7 @@ func main() {
 	apiCfg := apiConfig{
 		db:       dbQueries,
 		platform: platform,
+		secret:   secret,
 	}
 	servHandler := http.NewServeMux()
 	s := &http.Server{
@@ -85,6 +87,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	secret         string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -111,8 +114,7 @@ func (cfg *apiConfig) handlerResetRequestCount(w http.ResponseWriter, r *http.Re
 }
 func (cfg *apiConfig) handlerValidate(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Body   string    `json:"body"`
-		UserID uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
 	}
 	type successResponse struct {
 		Valid bool `json:"valid"`
@@ -120,13 +122,25 @@ func (cfg *apiConfig) handlerValidate(w http.ResponseWriter, r *http.Request) {
 	type cleanResp struct {
 		Clean string `json:"cleaned_body"`
 	}
-
 	decoder := json.NewDecoder(r.Body)
 	params := parameters{}
 	err := decoder.Decode(&params)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		respondWithError(w, 500, "something went wrong")
+		return
+	}
+	authtoken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 500, "something went wrong")
+		return
+	}
+	authuser, err := auth.ValidateJWT(authtoken, cfg.secret)
+
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "Unauthorized")
 		return
 	}
 	if len(params.Body) > 140 {
@@ -167,7 +181,7 @@ func (cfg *apiConfig) handlerValidate(w http.ResponseWriter, r *http.Request) {
 	//}
 	chirpdat, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{
 		Body:   clean.Clean,
-		UserID: params.UserID,
+		UserID: authuser,
 	})
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -192,7 +206,6 @@ func (cfg *apiConfig) handlerValidate(w http.ResponseWriter, r *http.Request) {
 	w.Write(dat)
 }
 func respondWithError(w http.ResponseWriter, code int, e string) {
-	w.WriteHeader(code)
 	type errorResponse struct {
 		Error string `json:"error"`
 	}
@@ -206,7 +219,7 @@ func respondWithError(w http.ResponseWriter, code int, e string) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(400)
+	w.WriteHeader(code)
 	w.Write(dat)
 }
 func (cfg *apiConfig) handlerUserByEmail(w http.ResponseWriter, r *http.Request) {
@@ -320,13 +333,21 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	type useremail struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
+		Expire   int    `json:"expires_in_seconds"`
 	}
 	params := useremail{}
 	decoder := json.NewDecoder(r.Body)
 	err := decoder.Decode(&params)
+	if params.Expire > 3600 {
+		params.Expire = 3600
+	}
+	if params.Expire <= 0 {
+		params.Expire = 3600
+	}
+
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
-		respondWithError(w, 500, "something went wrong")
+		respondWithError(w, 500, "params")
 		return
 	}
 	userinfo, err := cfg.db.GetHashByEmail(r.Context(), params.Email)
@@ -346,23 +367,33 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, 401, "something went wrong")
 		return
 	}
+
 	if check == true {
+		seconds := time.Duration(params.Expire) * time.Second
+		tokenstring, err := auth.MakeJWT(userinfo.ID, cfg.secret, seconds)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			respondWithError(w, 500, "token creation")
+			return
+		}
 		type user struct {
 			ID     uuid.UUID `json:"id"`
 			Create time.Time `json:"created_at"`
 			Update time.Time `json:"updated_at"`
 			Email  string    `json:"email"`
+			Token  string    `json:"token"`
 		}
 		userinfo := user{
 			ID:     userinfo.ID,
 			Create: userinfo.CreatedAt,
 			Update: userinfo.UpdatedAt,
 			Email:  userinfo.Email,
+			Token:  tokenstring,
 		}
 		dat, err := json.Marshal(userinfo)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
-			respondWithError(w, 500, "something went wrong")
+			respondWithError(w, 500, "marshal error")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
