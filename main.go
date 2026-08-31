@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -35,6 +36,7 @@ func main() {
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
 	secret := os.Getenv("SECRET")
+	polka := os.Getenv("POLKA_KEY")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		fmt.Println(err)
@@ -44,6 +46,7 @@ func main() {
 		db:       dbQueries,
 		platform: platform,
 		secret:   secret,
+		polka:    polka,
 	}
 	servHandler := http.NewServeMux()
 	s := &http.Server{
@@ -93,6 +96,7 @@ type apiConfig struct {
 	db             *database.Queries
 	platform       string
 	secret         string
+	polka          string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -279,6 +283,53 @@ func (cfg *apiConfig) handlerUserByEmail(w http.ResponseWriter, r *http.Request)
 	w.Write(dat)
 }
 func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
+	authorIDString := r.URL.Query().Get("author_id")
+	sortby := r.URL.Query().Get("sort")
+	if authorIDString != "" {
+		authorID, err := uuid.Parse(authorIDString)
+
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			respondWithError(w, 401, "something went wrong")
+			return
+		}
+		if authorIDString != "" {
+			authchirpslice, err := cfg.db.GetChirpsByAuthor(r.Context(), authorID)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				respondWithError(w, 500, "something went wrong")
+				return
+			}
+			chirps := []chirp{}
+			for _, dbChirps := range authchirpslice {
+				chirps = append(chirps, chirp{
+					Id:         dbChirps.ID,
+					Created_at: dbChirps.CreatedAt,
+					Updated_at: dbChirps.UpdatedAt,
+					Body:       dbChirps.Body,
+					User_id:    dbChirps.UserID,
+				})
+			}
+			if sortby == "desc" {
+				sort.Slice(chirps, func(i, j int) bool {
+					return chirps[i].Created_at.After(chirps[j].Created_at)
+				})
+			} else {
+				sort.Slice(chirps, func(i, j int) bool {
+					return chirps[i].Created_at.Before(chirps[j].Created_at)
+				})
+			}
+			dat, err := json.Marshal(chirps)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				respondWithError(w, 500, "something went wrong")
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			w.Write(dat)
+		}
+	}
 	chirpslice, err := cfg.db.GetChirps(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -293,6 +344,15 @@ func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
 			Updated_at: dbChirps.UpdatedAt,
 			Body:       dbChirps.Body,
 			User_id:    dbChirps.UserID,
+		})
+	}
+	if sortby == "desc" {
+		sort.Slice(chirps, func(i, j int) bool {
+			return chirps[i].Created_at.After(chirps[j].Created_at)
+		})
+	} else {
+		sort.Slice(chirps, func(i, j int) bool {
+			return chirps[i].Created_at.Before(chirps[j].Created_at)
 		})
 	}
 	dat, err := json.Marshal(chirps)
@@ -574,6 +634,19 @@ func (cfg *apiConfig) handlerDeleteChirp(w http.ResponseWriter, r *http.Request)
 
 }
 func (cfg *apiConfig) handlerChirpyRed(w http.ResponseWriter, r *http.Request) {
+	apikey, err := auth.GetAPIKey(r.Header)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	if apikey != cfg.polka {
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			respondWithError(w, 401, "something went wrong")
+			return
+		}
+	}
 	type dataThing struct {
 		UserID string `json:"user_id"`
 	}
@@ -583,7 +656,7 @@ func (cfg *apiConfig) handlerChirpyRed(w http.ResponseWriter, r *http.Request) {
 	}
 	params := webhookinfo{}
 	decoder := json.NewDecoder(r.Body)
-	err := decoder.Decode(&params)
+	err = decoder.Decode(&params)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		respondWithError(w, 401, "something went wrong")
