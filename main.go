@@ -66,6 +66,11 @@ func main() {
 	servHandler.HandleFunc("POST /api/chirps", apiCfg.handlerValidate)
 	servHandler.HandleFunc("POST /api/users", apiCfg.handlerUserByEmail)
 	servHandler.HandleFunc("POST /api/login", apiCfg.handlerLogin)
+	servHandler.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
+	servHandler.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke)
+	servHandler.HandleFunc("PUT /api/users", apiCfg.handlerUpdateInfo)
+	servHandler.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.handlerDeleteChirp)
+	servHandler.HandleFunc("POST /api/polka/webhooks", apiCfg.handlerChirpyRed)
 	log.Fatal(s.ListenAndServe())
 }
 func handlerReadiness(w http.ResponseWriter, r *http.Request) {
@@ -254,12 +259,14 @@ func (cfg *apiConfig) handlerUserByEmail(w http.ResponseWriter, r *http.Request)
 		Create time.Time `json:"created_at"`
 		Update time.Time `json:"updated_at"`
 		Email  string    `json:"email"`
+		IsRed  bool      `json:"is_chirpy_red"`
 	}
 	userinfo := user{
 		ID:     userresp.ID,
 		Create: userresp.CreatedAt,
 		Update: userresp.UpdatedAt,
 		Email:  userresp.Email,
+		IsRed:  userresp.IsChirpyRed,
 	}
 	dat, err := json.Marshal(userinfo)
 	if err != nil {
@@ -333,17 +340,10 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	type useremail struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
-		Expire   int    `json:"expires_in_seconds"`
 	}
 	params := useremail{}
 	decoder := json.NewDecoder(r.Body)
 	err := decoder.Decode(&params)
-	if params.Expire > 3600 {
-		params.Expire = 3600
-	}
-	if params.Expire <= 0 {
-		params.Expire = 3600
-	}
 
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -369,7 +369,20 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if check == true {
-		seconds := time.Duration(params.Expire) * time.Second
+		seconds := time.Duration(3600) * time.Second
+
+		expire := time.Now().Add(time.Duration(1440) * time.Hour)
+		refreshTokenString := auth.MakeRefreshToken()
+		err := cfg.db.CreateRefreshToken(r.Context(), database.CreateRefreshTokenParams{
+			Token:     refreshTokenString,
+			UserID:    userinfo.ID,
+			ExpiresAt: expire,
+		})
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			respondWithError(w, 500, "token creation")
+			return
+		}
 		tokenstring, err := auth.MakeJWT(userinfo.ID, cfg.secret, seconds)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
@@ -377,18 +390,22 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		type user struct {
-			ID     uuid.UUID `json:"id"`
-			Create time.Time `json:"created_at"`
-			Update time.Time `json:"updated_at"`
-			Email  string    `json:"email"`
-			Token  string    `json:"token"`
+			ID            uuid.UUID `json:"id"`
+			Create        time.Time `json:"created_at"`
+			Update        time.Time `json:"updated_at"`
+			Email         string    `json:"email"`
+			IsRed         bool      `json:"is_chirpy_red"`
+			Token         string    `json:"token"`
+			Refresh_token string    `json:"refresh_token"`
 		}
 		userinfo := user{
-			ID:     userinfo.ID,
-			Create: userinfo.CreatedAt,
-			Update: userinfo.UpdatedAt,
-			Email:  userinfo.Email,
-			Token:  tokenstring,
+			ID:            userinfo.ID,
+			Create:        userinfo.CreatedAt,
+			Update:        userinfo.UpdatedAt,
+			Email:         userinfo.Email,
+			IsRed:         userinfo.IsChirpyRed,
+			Token:         tokenstring,
+			Refresh_token: refreshTokenString,
 		}
 		dat, err := json.Marshal(userinfo)
 		if err != nil {
@@ -400,4 +417,195 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		w.Write(dat)
 	}
+}
+func (cfg *apiConfig) handlerRefresh(w http.ResponseWriter, r *http.Request) {
+	seconds := time.Duration(3600) * time.Second
+	tokenstring, err := auth.GetBearerToken(r.Header)
+	type tokenreturn struct {
+		Token string `json:"token"`
+	}
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	tokeninfo, err := cfg.db.GetToken(r.Context(), tokenstring)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	if tokeninfo.RevokedAt.Valid == true || time.Now().Compare(tokeninfo.ExpiresAt) >= 0 {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+
+	} else {
+		madetoken, err := auth.MakeJWT(tokeninfo.UserID, cfg.secret, seconds)
+		currenttoken := tokenreturn{
+			Token: madetoken,
+		}
+		dat, err := json.Marshal(currenttoken)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			respondWithError(w, 500, "marshal error")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write(dat)
+		return
+	}
+
+}
+func (cfg *apiConfig) handlerRevoke(w http.ResponseWriter, r *http.Request) {
+	tokenstring, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	cfg.db.RevokeToken(r.Context(), tokenstring)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(204)
+}
+func (cfg *apiConfig) handlerUpdateInfo(w http.ResponseWriter, r *http.Request) {
+	tokenstring, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	type emailpass struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	params := emailpass{}
+	decoder := json.NewDecoder(r.Body)
+	err = decoder.Decode(&params)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	tokenuserid, err := auth.ValidateJWT(tokenstring, cfg.secret)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	hpass, err := auth.HashPassword(params.Password)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	cfg.db.UpdateUser(r.Context(), database.UpdateUserParams{
+		Email:          params.Email,
+		HashedPassword: hpass,
+		ID:             tokenuserid,
+	})
+	hashinfo, err := cfg.db.GetHashByEmail(r.Context(), params.Email)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	type user struct {
+		ID             uuid.UUID `json:"id"`
+		Create         time.Time `json:"created_at"`
+		Update         time.Time `json:"updated_at"`
+		Email          string    `json:"email"`
+		IsRed          bool      `json:"is_chirpy_red"`
+		HashedPassword string    `json:"password_hash"`
+	}
+	userinfo := user{
+		ID:             hashinfo.ID,
+		Create:         hashinfo.CreatedAt,
+		Update:         hashinfo.UpdatedAt,
+		Email:          hashinfo.Email,
+		IsRed:          hashinfo.IsChirpyRed,
+		HashedPassword: hpass,
+	}
+	dat, err := json.Marshal(userinfo)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 500, "marshal error")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write(dat)
+
+}
+func (cfg *apiConfig) handlerDeleteChirp(w http.ResponseWriter, r *http.Request) {
+	chirpidstring := r.PathValue("chirpID")
+	chirpid, err := uuid.Parse(chirpidstring)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	tokenstring, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	tokenuserid, err := auth.ValidateJWT(tokenstring, cfg.secret)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	userid, err := cfg.db.GetChirpUserID(r.Context(), chirpid)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 404, "something went wrong")
+		return
+	}
+	if tokenuserid == userid {
+		cfg.db.DeleteChirp(r.Context(), chirpid)
+		w.WriteHeader(204)
+		return
+	}
+	w.WriteHeader(403)
+
+}
+func (cfg *apiConfig) handlerChirpyRed(w http.ResponseWriter, r *http.Request) {
+	type dataThing struct {
+		UserID string `json:"user_id"`
+	}
+	type webhookinfo struct {
+		Event string    `json:"event"`
+		Data  dataThing `json:"data"`
+	}
+	params := webhookinfo{}
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&params)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	if params.Event != "user.upgraded" {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 204, "something went wrong")
+		return
+	}
+	id, err := uuid.Parse(params.Data.UserID)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 401, "something went wrong")
+		return
+	}
+	err = cfg.db.UpdateChirpyRed(r.Context(), id)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		respondWithError(w, 404, "something went wrong")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(204)
 }
